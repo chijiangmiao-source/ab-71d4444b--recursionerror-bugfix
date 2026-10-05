@@ -327,13 +327,22 @@ def analyze_forest(g: Grammar, symbol_families: Dict[SKey, List[IKey]],
     # this both decides ambiguity and supplies the two witness trees under
     # the stable total order -- without enumerating all derivations.
     #
+    # The forest dependency graph is a DAG (the static pass rejects every
+    # non-consuming cycle), but a single legal production may carry an
+    # arbitrarily long right-hand side, whose binarized intermediate
+    # nodes form a chain thousands deep -- protocol limits bound neither
+    # RHS length nor parse-tree depth.  Evaluation is therefore an
+    # explicit-stack postorder walk, never Python recursion, so any legal
+    # RHS length is handled instead of overflowing the call stack.
+    #
     # Recipe shapes (immutable, structurally shared):
     #   ("T", terminal_skey)
     #   ("N", skey, pid, (child_recipe, ...))
     Recipe = tuple
     best_s: Dict[SKey, List[Tuple[Tuple[int, ...], Recipe]]] = {}
     best_i: Dict[IKey, List[Tuple[Tuple[int, ...], Tuple[Recipe, ...]]]] = {}
-    visiting: set = set()
+    in_progress_s: set = set()
+    in_progress_i: set = set()
 
     def merge(cands):
         """Deduplicate by sequence, sort ascending, keep the two smallest."""
@@ -343,74 +352,116 @@ def analyze_forest(g: Grammar, symbol_families: Dict[SKey, List[IKey]],
                 by_seq[seq] = payload
         return [(seq, by_seq[seq]) for seq in sorted(by_seq)[:2]]
 
-    def eval_s(skey: SKey):
-        if skey in best_s:
-            return best_s[skey]
-        if _is_terminal(skey):
-            best_s[skey] = [((), ("T", skey))]
-            return best_s[skey]
-        if skey in visiting:  # pragma: no cover - guarded by static pass
-            raise EngineError(
-                NONCONSUMING_CYCLE,
-                f"内部错误：森林提取阶段在符号节点 {skey} 遇到循环依赖",
-            )
-        visiting.add(skey)
-        cands = []
-        for ik in symbol_families[skey]:
-            for seq, kids in eval_i(ik):
+    def cycle_error(kind: str, key):
+        return EngineError(
+            NONCONSUMING_CYCLE,
+            f"内部错误：森林提取阶段在{kind}节点 {key} 遇到循环依赖",
+        )
+
+    # Postorder jobs: a "*_done" marker is enqueued before the node's
+    # dependencies, so it is processed only once all children are
+    # memoized in best_s / best_i.  Re-requesting a node already in
+    # progress is a back edge, i.e. a non-consuming cycle.
+    jobs: List[Tuple[str, Any]] = [("s", root)]
+    while jobs:
+        tag, key = jobs.pop()
+
+        if tag == "s":
+            if key in best_s:
+                continue
+            if _is_terminal(key):
+                best_s[key] = [((), ("T", key))]
+                continue
+            if key in in_progress_s:  # pragma: no cover - guarded above
+                raise cycle_error("符号", key)
+            in_progress_s.add(key)
+            jobs.append(("s_done", key))
+            for ik in symbol_families[key]:
+                jobs.append(("i", ik))
+
+        elif tag == "i":
+            if key in best_i:
+                continue
+            if key[2] == 0:  # empty production prefix: one way, no children
+                best_i[key] = [((), ())]
+                continue
+            if key in in_progress_i:  # pragma: no cover - guarded above
+                raise cycle_error("中间", key)
+            in_progress_i.add(key)
+            jobs.append(("i_done", key))
+            for left, right in inter_families[key]:
+                jobs.append(("s", right))
+                if left is not None:
+                    jobs.append(("i", left))
+
+        elif tag == "s_done":
+            in_progress_s.discard(key)
+            cands = []
+            for ik in symbol_families[key]:
+                opts = best_i.get(ik)
+                if opts is None:  # pragma: no cover - guarded above
+                    raise cycle_error("符号", key)
                 pid = ik[1]
-                cands.append(((pid,) + seq, ("N", skey, pid, tuple(kids))))
-        visiting.discard(skey)
-        best_s[skey] = merge(cands)
-        return best_s[skey]
+                for seq, kids in opts:
+                    cands.append(((pid,) + seq, ("N", key, pid, tuple(kids))))
+            best_s[key] = merge(cands)
 
-    def eval_i(ikey: IKey):
-        if ikey in best_i:
-            return best_i[ikey]
-        k = ikey[2]
-        if k == 0:  # empty production prefix: one way, no children
-            best_i[ikey] = [((), ())]
-            return best_i[ikey]
-        if ikey in visiting:  # pragma: no cover - guarded by static pass
-            raise EngineError(
-                NONCONSUMING_CYCLE,
-                f"内部错误：森林提取阶段在中间节点 {ikey} 遇到循环依赖",
-            )
-        visiting.add(ikey)
-        cands = []
-        for left, right in inter_families[ikey]:
-            right_opts = eval_s(right)
-            left_opts = eval_i(left) if left is not None else [((), ())]
-            for lseq, lkids in left_opts:
-                for rseq, rrecipe in right_opts:
-                    cands.append((lseq + rseq, tuple(lkids) + (rrecipe,)))
-        visiting.discard(ikey)
-        best_i[ikey] = merge(cands)
-        return best_i[ikey]
+        else:  # "i_done"
+            in_progress_i.discard(key)
+            cands = []
+            for left, right in inter_families[key]:
+                right_opts = best_s.get(right)
+                if right_opts is None:  # pragma: no cover - guarded above
+                    raise cycle_error("中间", key)
+                left_opts = best_i.get(left) if left is not None else [((), ())]
+                if left_opts is None:  # pragma: no cover - guarded above
+                    raise cycle_error("中间", key)
+                for lseq, lkids in left_opts:
+                    for rseq, rrecipe in right_opts:
+                        cands.append((lseq + rseq, tuple(lkids) + (rrecipe,)))
+            best_i[key] = merge(cands)
 
-    options = eval_s(root)
+    options = best_s[root]
     ambiguous = len(options) >= 2
 
     def render(recipe: Recipe) -> dict:
-        tag = recipe[0]
-        if tag == "T":
-            _, skey = recipe
-            return {"token": skey[1], "span": [skey[2], skey[3]]}
-        _, skey, pid, kids = recipe
-        return {
-            "symbol": skey[1],
-            "production": pid,
-            "span": [skey[2], skey[3]],
-            "children": [render(k) for k in kids],
-        }
+        # Iterative expansion: parse trees can be arbitrarily deep (a long
+        # RHS nests thousands of recipe levels), so recursion here would
+        # undo the stack-safe evaluation above.  Mutable dicts are filled
+        # in place, children pre-allocated in order.
+        root_obj: Dict[str, Any] = {}
+        pending = [(recipe, root_obj)]
+        while pending:
+            rec, obj = pending.pop()
+            tag = rec[0]
+            if tag == "T":
+                _, skey = rec
+                obj["token"] = skey[1]
+                obj["span"] = [skey[2], skey[3]]
+                continue
+            _, skey, pid, kids = rec
+            obj["symbol"] = skey[1]
+            obj["production"] = pid
+            obj["span"] = [skey[2], skey[3]]
+            children = [{} for _ in kids]
+            obj["children"] = children
+            for child_rec, child_obj in zip(kids, children):
+                pending.append((child_rec, child_obj))
+        return root_obj
 
     def pid_sequence(recipe: Recipe) -> List[int]:
-        if recipe[0] == "T":
-            return []
-        _, _, pid, kids = recipe
-        out = [pid]
-        for k in kids:
-            out.extend(pid_sequence(k))
+        out: List[int] = []
+        stack = [recipe]
+        while stack:
+            rec = stack.pop()
+            if rec[0] == "T":
+                continue
+            _, _, pid, kids = rec
+            out.append(pid)
+            # Push in reverse so the first child is expanded first,
+            # matching preorder traversal.
+            for child in reversed(kids):
+                stack.append(child)
         return out
 
     first_seq, first_recipe = options[0]

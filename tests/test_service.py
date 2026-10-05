@@ -119,6 +119,29 @@ class TestService(unittest.TestCase):
         self.assertEqual(b["result"]["production_sequences"],
                          {"first": [1], "second": [2]})
 
+    def test_long_nullable_rhs_completes_normally(self):
+        # A legal RHS of 1200 nullable symbols over the empty token stream
+        # must answer normally (it used to abort the handler with a
+        # recursion error, leaving the caller without any verdict).
+        width = 1200
+        payload = {
+            "audit_id": "A-5", "nonterminals": ["S", "A"],
+            "productions": [{"id": 1, "lhs": "A", "rhs": []},
+                            {"id": 2, "lhs": "S", "rhs": ["A"] * width}],
+            "start": "S", "tokens": [],
+        }
+        s, b = self.h.post(payload)
+        self.assertEqual(s, 200)
+        result = b["result"]
+        self.assertEqual(result["verdict"], "UNIQUE_ACCEPTED")
+        self.assertEqual(result["production_sequence"], [2] + [1] * width)
+        self.assertEqual(len(result["tree"]["children"]), width)
+        self.assertEqual(b["seal_status"], "SEALED")
+        # The conclusion is also retrievable afterwards.
+        s2, b2 = self.h.get("/api/v1/conclusion/A-5")
+        self.assertEqual(s2, 200)
+        self.assertEqual(b2["conclusion"]["verdict"], "UNIQUE_ACCEPTED")
+
 
 if __name__ == "__main__":
     unittest.main()

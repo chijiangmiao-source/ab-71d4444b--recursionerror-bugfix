@@ -144,6 +144,34 @@ def main() -> int:
           and orig.get("production_sequence") == [1],
           "冲突响应保留并回传原始证据")
 
+    step("步骤 2b：合法超长右部（1200 个可空符号 + 空词元）必须正常仲裁")
+    # 协议不限制产生式右部长度：S -> A*1200, A -> ε 在空输入上只有
+    # 唯一有限派生，必须正常返回 UNIQUE_ACCEPTED 与唯一派生树，而非中断。
+    width = 1200
+    lid = f"verify-longrhs-{run_id}"
+    status, body = http_post("/api/v1/analyze", {
+        "audit_id": lid,
+        "nonterminals": ["S", "A"],
+        "productions": [
+            {"id": 1, "lhs": "A", "rhs": []},
+            {"id": 2, "lhs": "S", "rhs": ["A"] * width},
+        ],
+        "start": "S",
+        "tokens": [],
+    })
+    check(status == 200, f"超长右部场景 HTTP 200（实际 {status}）")
+    lres = body.get("result", {})
+    check(lres.get("verdict") == "UNIQUE_ACCEPTED",
+          f"verdict=UNIQUE_ACCEPTED（实际 {lres.get('verdict')}）")
+    check(lres.get("production_sequence") == [2] + [1] * width,
+          "唯一先序产生式编号序列为 [2, 1, …, 1]（共 1201 项）")
+    ltree = lres.get("tree", {})
+    check(ltree.get("symbol") == "S" and ltree.get("production") == 2
+          and ltree.get("span") == [0, 0]
+          and len(ltree.get("children", [])) == width,
+          "返回唯一派生树：S 下挂 1200 个 A->ε 叶子，整体跨度 [0,0]")
+    check(body.get("seal_status") == "SEALED", "超长右部结论已封存 SEALED")
+
     step("步骤 3a：歧义接受场景（两棵按编号序列稳定选出的树）")
     aid = f"verify-amb-{run_id}"
     status, body = http_post("/api/v1/analyze", {

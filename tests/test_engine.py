@@ -78,6 +78,32 @@ class TestUniqueAcceptance(unittest.TestCase):
         self.assertEqual(r["verdict"], UNIQUE)
         self.assertEqual(r["production_sequence"], [1, 2])
 
+    def test_long_nullable_rhs_unique(self):
+        # Protocol bounds productions/tokens but NOT right-hand-side
+        # length: S -> A A ... A (1200 occurrences) and A -> epsilon on
+        # the empty token stream has exactly one finite derivation.  The
+        # binarized forest chains 1200 intermediate nodes, which used to
+        # overflow Python's recursion limit during tree extraction.
+        width = 1200
+        g = G(["S", "A"],
+              [P(1, "A", []), P(2, "S", ["A"] * width)],
+              "S", [])
+        r = analyze(g)
+        self.assertEqual(r["verdict"], UNIQUE)
+        self.assertEqual(r["production_sequence"], [2] + [1] * width)
+        tree = r["tree"]
+        self.assertEqual(tree["symbol"], "S")
+        self.assertEqual(tree["span"], [0, 0])
+        self.assertEqual(tree["production"], 2)
+        children = tree["children"]
+        self.assertEqual(len(children), width)
+        self.assertTrue(all(
+            c["symbol"] == "A" and c["production"] == 1
+            and c["span"] == [0, 0] and c["children"] == []
+            for c in children
+        ))
+        self.assertNotIn("trees", r)
+
 
 class TestAmbiguity(unittest.TestCase):
     def test_duplicate_productions(self):
