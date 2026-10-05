@@ -321,20 +321,26 @@ def analyze_forest(g: Grammar, symbol_families: Dict[SKey, List[IKey]],
             f" {g.start} 覆盖 [0,{n}] 的完整派生节点{hint}",
         )
 
-    # Every forest node keeps the lexicographically smallest TWO distinct
-    # preorder production-id sequences reachable from it (memoized).  A
-    # preorder pid sequence uniquely identifies a concrete derivation, so
-    # this both decides ambiguity and supplies the two witness trees under
-    # the stable total order -- without enumerating all derivations.
-    #
     # Recipe shapes (immutable, structurally shared):
     #   ("T", terminal_skey)
     #   ("N", skey, pid, (child_recipe, ...))
     Recipe = tuple
     best_s: Dict[SKey, List[Tuple[Tuple[int, ...], Recipe]]] = {}
     best_i: Dict[IKey, List[Tuple[Tuple[int, ...], Tuple[Recipe, ...]]]] = {}
-    visiting: set = set()
 
+    # Every node's value depends only on its forest children, so the DAG
+    # is evaluated with an explicit work stack (postorder DFS) rather than
+    # Python recursion.  This matters for the protocol's *wide*
+    # productions: binarization turns ``A -> X1...Xm`` into an m-deep
+    # left-leaning chain of intermediate nodes, and a legal RHS may be far
+    # longer than the interpreter's recursion limit (e.g. 1200 nullable
+    # symbols against the empty input).  Deep parse trees get the same
+    # treatment for free.  Memoization still computes each node once.
+    #
+    # Work items are ("n", kind, key) to visit a node and
+    # ("d", kind, key) emitted beforehand to combine its children once
+    # every descendant visit has been resolved.
+    #   progress[(kind, key)]: 1 = visited, awaiting the combine marker
     def merge(cands):
         """Deduplicate by sequence, sort ascending, keep the two smallest."""
         by_seq = {}
@@ -343,75 +349,106 @@ def analyze_forest(g: Grammar, symbol_families: Dict[SKey, List[IKey]],
                 by_seq[seq] = payload
         return [(seq, by_seq[seq]) for seq in sorted(by_seq)[:2]]
 
-    def eval_s(skey: SKey):
-        if skey in best_s:
-            return best_s[skey]
+    def base_s(skey: SKey) -> bool:
         if _is_terminal(skey):
             best_s[skey] = [((), ("T", skey))]
-            return best_s[skey]
-        if skey in visiting:  # pragma: no cover - guarded by static pass
-            raise EngineError(
-                NONCONSUMING_CYCLE,
-                f"内部错误：森林提取阶段在符号节点 {skey} 遇到循环依赖",
-            )
-        visiting.add(skey)
-        cands = []
-        for ik in symbol_families[skey]:
-            for seq, kids in eval_i(ik):
-                pid = ik[1]
-                cands.append(((pid,) + seq, ("N", skey, pid, tuple(kids))))
-        visiting.discard(skey)
-        best_s[skey] = merge(cands)
-        return best_s[skey]
+            return True
+        return False
 
-    def eval_i(ikey: IKey):
-        if ikey in best_i:
-            return best_i[ikey]
-        k = ikey[2]
-        if k == 0:  # empty production prefix: one way, no children
+    def base_i(ikey: IKey) -> bool:
+        if ikey[2] == 0:  # empty production prefix: one way, no children
             best_i[ikey] = [((), ())]
-            return best_i[ikey]
-        if ikey in visiting:  # pragma: no cover - guarded by static pass
-            raise EngineError(
-                NONCONSUMING_CYCLE,
-                f"内部错误：森林提取阶段在中间节点 {ikey} 遇到循环依赖",
-            )
-        visiting.add(ikey)
-        cands = []
-        for left, right in inter_families[ikey]:
-            right_opts = eval_s(right)
-            left_opts = eval_i(left) if left is not None else [((), ())]
-            for lseq, lkids in left_opts:
-                for rseq, rrecipe in right_opts:
-                    cands.append((lseq + rseq, tuple(lkids) + (rrecipe,)))
-        visiting.discard(ikey)
-        best_i[ikey] = merge(cands)
-        return best_i[ikey]
+            return True
+        return False
 
-    options = eval_s(root)
+    progress: Dict[Tuple[str, tuple], int] = {}
+
+    def children_of(kind: str, key):
+        if kind == "s":
+            for ik in symbol_families[key]:
+                yield "i", ik
+        else:
+            for left, right in inter_families[key]:
+                yield "s", right
+                if left is not None:
+                    yield "i", left
+
+    work: list = [("n", "s", root)]
+    while work:
+        tag, kind, key = work.pop()
+
+        if tag == "n":
+            done = best_s if kind == "s" else best_i
+            if key in done:
+                continue
+            if kind == "s" and base_s(key):
+                continue
+            if kind == "i" and base_i(key):
+                continue
+            marker = (kind, key)
+            if progress.get(marker) == 1:
+                # Reaching an in-progress node from one of its descendants
+                # is a circular forest dependency; the static pass rejects
+                # every such grammar, so this is only a safety net.
+                raise EngineError(
+                    NONCONSUMING_CYCLE,
+                    f"内部错误：森林提取阶段在节点 {key} 遇到循环依赖",
+                )
+            progress[marker] = 1
+            work.append(("d", kind, key))
+            for ckind, ckey in children_of(kind, key):
+                cdone = best_s if ckind == "s" else best_i
+                if ckey not in cdone:
+                    work.append(("n", ckind, ckey))
+            continue
+
+        # tag == "d": all descendants are memoized; combine them.
+        progress.pop((kind, key), None)
+        if kind == "s":
+            skey = key
+            cands = []
+            for ik in symbol_families[skey]:
+                pid = ik[1]
+                for seq, kids in best_i[ik]:
+                    cands.append(((pid,) + seq, ("N", skey, pid, tuple(kids))))
+            best_s[skey] = merge(cands)
+        else:
+            ikey = key
+            cands = []
+            for left, right in inter_families[ikey]:
+                right_opts = best_s[right]
+                left_opts = best_i[left] if left is not None else [((), ())]
+                for lseq, lkids in left_opts:
+                    for rseq, rrecipe in right_opts:
+                        cands.append((lseq + rseq, tuple(lkids) + (rrecipe,)))
+            best_i[ikey] = merge(cands)
+
+    options = best_s[root]
     ambiguous = len(options) >= 2
 
     def render(recipe: Recipe) -> dict:
-        tag = recipe[0]
-        if tag == "T":
-            _, skey = recipe
-            return {"token": skey[1], "span": [skey[2], skey[3]]}
-        _, skey, pid, kids = recipe
-        return {
-            "symbol": skey[1],
-            "production": pid,
-            "span": [skey[2], skey[3]],
-            "children": [render(k) for k in kids],
-        }
-
-    def pid_sequence(recipe: Recipe) -> List[int]:
-        if recipe[0] == "T":
-            return []
-        _, _, pid, kids = recipe
-        out = [pid]
-        for k in kids:
-            out.extend(pid_sequence(k))
-        return out
+        # Iterative tree materialization: a legal derivation can be deeper
+        # than the interpreter recursion limit, so no Python call may nest
+        # per tree node.  Each task fills a holder dict that the parent
+        # already references (placeholders pushed in reverse child order).
+        root_obj: dict = {}
+        tasks: List[Tuple[Recipe, dict]] = [(recipe, root_obj)]
+        while tasks:
+            cur, holder = tasks.pop()
+            if cur[0] == "T":
+                _, skey = cur
+                holder["token"] = skey[1]
+                holder["span"] = [skey[2], skey[3]]
+                continue
+            _, skey, pid, kids = cur
+            children = [{} for _ in kids]
+            holder["symbol"] = skey[1]
+            holder["production"] = pid
+            holder["span"] = [skey[2], skey[3]]
+            holder["children"] = children
+            for k, child_holder in zip(reversed(kids), reversed(children)):
+                tasks.append((k, child_holder))
+        return root_obj
 
     first_seq, first_recipe = options[0]
     result: Dict[str, Any] = {

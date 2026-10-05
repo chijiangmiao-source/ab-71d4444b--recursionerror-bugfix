@@ -106,6 +106,31 @@ class TestService(unittest.TestCase):
         self.assertEqual(s2, 200)
         self.assertEqual(b2["conclusion"]["verdict"], "REJECTED")
 
+    def test_wide_nullable_rhs_does_not_abort_handler(self):
+        # Public HTTP entry point regression: S -> A*1200, A -> eps, empty
+        # token stream is a legal, unambiguous request.  The binarized
+        # forest is 1200 nodes deep; it must answer 200 UNIQUE_ACCEPTED
+        # instead of the handler thread dying on a recursion-limit error.
+        payload = {
+            "audit_id": "wide-1200",
+            "nonterminals": ["S", "A"],
+            "productions": [
+                {"id": 1, "lhs": "A", "rhs": []},
+                {"id": 2, "lhs": "S", "rhs": ["A"] * 1200},
+            ],
+            "start": "S",
+            "tokens": [],
+        }
+        s, b = self.h.post(payload)
+        self.assertEqual(s, 200)
+        result = b["result"]
+        self.assertEqual(result["verdict"], "UNIQUE_ACCEPTED")
+        self.assertEqual(result["production_sequence"], [2] + [1] * 1200)
+        tree = result["tree"]
+        self.assertEqual(tree["symbol"], "S")
+        self.assertEqual(tree["span"], [0, 0])
+        self.assertEqual(len(tree["children"]), 1200)
+
     def test_ambiguous_returns_two_trees(self):
         payload = {
             "audit_id": "A-4", "nonterminals": ["S"],

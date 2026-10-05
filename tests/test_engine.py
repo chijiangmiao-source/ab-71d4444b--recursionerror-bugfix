@@ -273,6 +273,31 @@ class TestForestShapeAndPolynomialBehavior(unittest.TestCase):
         for which in ("first", "second"):
             walk(r["trees"][which], 0, 5)
 
+    def test_wide_nullable_production_1200(self):
+        # Protocol-wide regression: a single production may carry a very
+        # long RHS (no token-count limit on RHS length).  Binarization
+        # turns S -> A*1200 into a 1200-deep chain of intermediate nodes;
+        # with A -> eps and the empty input the grammar has exactly one
+        # finite derivation.  The verdict must be UNIQUE_ACCEPTED with the
+        # full derivation tree, not a stack-overflow abort.
+        g = G(["S", "A"],
+              [P(1, "A", []), P(2, "S", ["A"] * 1200)],
+              "S", [])
+        r = analyze(g)
+        self.assertEqual(r["verdict"], UNIQUE)
+        self.assertEqual(r["production_sequence"], [2] + [1] * 1200)
+        tree = r["tree"]
+        self.assertEqual(tree["symbol"], "S")
+        self.assertEqual(tree["production"], 2)
+        self.assertEqual(tree["span"], [0, 0])
+        children = tree["children"]
+        self.assertEqual(len(children), 1200)
+        self.assertTrue(
+            all(c == {"symbol": "A", "production": 1,
+                      "span": [0, 0], "children": []}
+                for c in children)
+        )
+
     def test_no_enumeration_at_48_highly_ambiguous_tokens(self):
         # Catalan(47) parses exist; the verdict must be instant.
         import time

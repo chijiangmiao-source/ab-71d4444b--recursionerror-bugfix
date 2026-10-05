@@ -144,6 +144,37 @@ def main() -> int:
           and orig.get("production_sequence") == [1],
           "冲突响应保留并回传原始证据")
 
+    step("步骤 2b：宽产生式（右部 1200 个可空符号，空词元）唯一接受")
+    # Protocol-wide case: RHS length is not token-limited.  Binarization
+    # turns S -> A*1200 into a 1200-deep intermediate chain; the request
+    # must complete normally with the unique derivation instead of
+    # aborting the HTTP handler.
+    wid = f"verify-wide-{run_id}"
+    status, body = http_post("/api/v1/analyze", {
+        "audit_id": wid,
+        "nonterminals": ["S", "A"],
+        "productions": [
+            {"id": 1, "lhs": "A", "rhs": []},
+            {"id": 2, "lhs": "S", "rhs": ["A"] * 1200},
+        ],
+        "start": "S",
+        "tokens": [],
+    })
+    res = body.get("result", {})
+    check(status == 200 and res.get("verdict") == "UNIQUE_ACCEPTED",
+          f"宽产生式正常完成且 UNIQUE_ACCEPTED（实际 HTTP {status} {res.get('verdict')}）")
+    wide_seq = [2] + [1] * 1200
+    check(res.get("production_sequence") == wide_seq,
+          "唯一产生式序列为 [2] + 1200 个 [1]")
+    wide_tree = res.get("tree", {})
+    wide_kids = wide_tree.get("children", [])
+    check(wide_tree.get("symbol") == "S" and wide_tree.get("span") == [0, 0]
+          and len(wide_kids) == 1200
+          and all(c.get("symbol") == "A" and c.get("production") == 1
+                  and c.get("span") == [0, 0] and c.get("children") == []
+                  for c in wide_kids),
+          "返回含 1200 个 A->ε 子节点的唯一派生树")
+
     step("步骤 3a：歧义接受场景（两棵按编号序列稳定选出的树）")
     aid = f"verify-amb-{run_id}"
     status, body = http_post("/api/v1/analyze", {
